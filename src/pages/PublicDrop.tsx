@@ -1,8 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { useParams } from 'react-router-dom'
 import { LogoMark } from '../components/Logo'
+import { api, ApiError } from '../lib/api'
 import { safeHttpUrl, visitorId, type Drop } from '../lib/drops'
-import { supabase } from '../lib/supabase'
 
 function useCountdown(target: number) {
   const [now, setNow] = useState(Date.now())
@@ -20,32 +20,32 @@ function useCountdown(target: number) {
   }
 }
 
-function track(dropId: string, type: 'view' | 'click' | 'signup') {
-  supabase?.from('drop_events').insert({ drop_id: dropId, type, visitor_id: visitorId() }).then(() => {})
-}
-
 export function PublicDrop() {
   const { slug } = useParams()
   const [drop, setDrop] = useState<Drop | null>(null)
+  const [preview, setPreview] = useState(false)
   const [state, setState] = useState<'loading' | 'ready' | 'missing'>('loading')
 
   useEffect(() => {
-    if (!supabase || !slug) {
-      setState('missing')
-      return
-    }
-    supabase
-      .from('drops')
-      .select('*')
-      .eq('slug', slug)
-      .maybeSingle()
-      .then(({ data }) => {
-        if (!data) return setState('missing')
-        setDrop(data as Drop)
-        setState('ready')
-        document.title = `${data.title} · Drop`
-        if (data.status !== 'draft') track(data.id, 'view')
+    if (!slug) return
+    const q = `?slug=${encodeURIComponent(slug)}`
+    // In your own app, "preview" shows drafts and doesn't count as a visit.
+    // On the public link that route doesn't exist, so shoppers fall through to the public one.
+    api
+      .get<{ drop: Drop }>(`preview/drop${q}`)
+      .then((d) => ({ ...d, isPreview: true }))
+      .catch(async (e) => {
+        if (e instanceof ApiError && (e.status === 404 || e.status === 401)) return { ...(await api.get<{ drop: Drop }>(`public/drop${q}`)), isPreview: false }
+        throw e
       })
+      .then(({ drop, isPreview }) => {
+        setDrop(drop)
+        setPreview(isPreview)
+        setState('ready')
+        document.title = drop.title
+        if (!isPreview) api.post('public/event', { dropId: drop.id, type: 'view', visitorId: visitorId() }).catch(() => {})
+      })
+      .catch(() => setState('missing'))
   }, [slug])
 
   if (state === 'loading') return <div className="page-loading">Loading…</div>
@@ -54,14 +54,13 @@ export function PublicDrop() {
       <div className="drop-page drop-page--center">
         <h1>Drop not found</h1>
         <p className="muted">This launch page doesn’t exist or isn’t public yet.</p>
-        <Link to="/" className="btn btn--ghost">Go home</Link>
       </div>
     )
   }
-  return <DropView drop={drop} />
+  return <DropView drop={drop} preview={preview} />
 }
 
-function DropView({ drop }: { drop: Drop }) {
+function DropView({ drop, preview }: { drop: Drop; preview: boolean }) {
   const t = useCountdown(new Date(drop.launch_at).getTime())
   const storeUrl = safeHttpUrl(drop.store_url)
   const isLive = drop.status === 'live' && t.done
@@ -69,7 +68,7 @@ function DropView({ drop }: { drop: Drop }) {
 
   return (
     <div className="drop-page">
-      {drop.status === 'draft' && <div className="demo-banner">Draft preview. Only you can see this page.</div>}
+      {preview && <div className="demo-banner">Preview from your app{drop.status === 'draft' ? '. This is a draft, shoppers can’t see it' : ''}. Visits here aren’t counted.</div>}
       <div className="drop-hero">
         {drop.image_url && (
           <div className="drop-hero__media">
@@ -87,8 +86,8 @@ function DropView({ drop }: { drop: Drop }) {
 
           {!ended && !t.done && (
             <div className="countdown" aria-label="Time until launch">
-              {[['days', t.days], ['hours', t.hours], ['mins', t.minutes], ['secs', t.seconds]].map(([label, value]) => (
-                <div key={label as string} className="countdown__cell">
+              {([['days', t.days], ['hours', t.hours], ['mins', t.minutes], ['secs', t.seconds]] as const).map(([label, value]) => (
+                <div key={label} className="countdown__cell">
                   <span className="countdown__num">{String(value).padStart(2, '0')}</span>
                   <span className="countdown__label">{label}</span>
                 </div>
@@ -99,15 +98,17 @@ function DropView({ drop }: { drop: Drop }) {
 
           {isLive && storeUrl && (
             <a className="btn btn--primary btn--lg btn--block" href={storeUrl} target="_blank" rel="noopener noreferrer"
-              onClick={() => track(drop.id, 'click')}>Shop the drop →</a>
+              onClick={() => !preview && api.post('public/event', { dropId: drop.id, type: 'click', visitorId: visitorId() }).catch(() => {})}>
+              Shop the drop →
+            </a>
           )}
 
-          {!ended && <WaitlistForm drop={drop} live={isLive} />}
+          {drop.status === 'live' && <WaitlistForm drop={drop} live={isLive} />}
           {ended && <p className="muted">This drop is over. Thanks to everyone who took part.</p>}
         </div>
       </div>
       <footer className="drop-footer">
-        <LogoMark size={18} /> <span>Launch page by <Link to="/">Selamont</Link></span>
+        <LogoMark size={18} /> <span>Powered by Selamont</span>
       </footer>
     </div>
   )
@@ -116,21 +117,22 @@ function DropView({ drop }: { drop: Drop }) {
 function WaitlistForm({ drop, live }: { drop: Drop; live: boolean }) {
   const [email, setEmail] = useState('')
   const [status, setStatus] = useState<'idle' | 'busy' | 'done' | 'dupe' | 'error'>('idle')
-
-  if (drop.status !== 'live') return null
+  const [message, setMessage] = useState('')
 
   const submit = async (e: FormEvent) => {
     e.preventDefault()
     setStatus('busy')
-    const { error } = await supabase!.from('waitlist').insert({ drop_id: drop.id, email: email.trim().toLowerCase() })
-    if (!error) {
-      track(drop.id, 'signup')
-      setStatus('done')
-    } else setStatus(error.code === '23505' ? 'dupe' : 'error')
+    try {
+      const res = await api.post<{ already: boolean }>('public/waitlist', { dropId: drop.id, email, visitorId: visitorId() })
+      setStatus(res.already ? 'dupe' : 'done')
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : 'Couldn’t join right now.')
+      setStatus('error')
+    }
   }
 
   if (status === 'done' || status === 'dupe') {
-    return <p className="form-notice">{status === 'done' ? 'You’re on the list! We’ll email you when it drops.' : 'You’re already on the list.'}</p>
+    return <p className="form-notice">{status === 'done' ? 'You’re on the list! We’ll let you know when it drops.' : 'You’re already on the list.'}</p>
   }
 
   return (
@@ -140,7 +142,7 @@ function WaitlistForm({ drop, live }: { drop: Drop; live: boolean }) {
       <button className={`btn btn--lg ${live ? 'btn--ghost' : 'btn--primary'}`} disabled={status === 'busy'}>
         {status === 'busy' ? 'Joining…' : live ? 'Notify me next time' : 'Join the waitlist'}
       </button>
-      {status === 'error' && <p className="form-error">Couldn’t join right now. Please try again.</p>}
+      {status === 'error' && <p className="form-error">{message}</p>}
     </form>
   )
 }

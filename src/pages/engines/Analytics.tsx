@@ -1,81 +1,42 @@
-import { useEffect, useMemo, useState } from 'react'
-import { EmptyState, NeedsDatabase, Spinner, Stat } from '../../components/ui'
-import { useAuth } from '../../lib/auth'
+import { useEffect, useState } from 'react'
+import { EmptyState, Spinner, Stat } from '../../components/ui'
+import { api } from '../../lib/api'
 import type { Drop } from '../../lib/drops'
-import { supabase } from '../../lib/supabase'
 
-interface EventRow {
-  drop_id: string
-  type: 'view' | 'click' | 'signup'
-  visitor_id: string | null
-  created_at: string
+interface Stats {
+  views: number
+  visitors: number
+  signups: number
+  clicks: number
+  waitlistTotal: number
+  series: { day: string; views: number; signups: number; clicks: number }[]
 }
 
 const RANGES = [7, 30, 90] as const
 
-function dayKey(d: Date) {
-  return d.toISOString().slice(0, 10)
-}
-
 export function Analytics() {
-  const { user } = useAuth()
   const [drops, setDrops] = useState<Drop[] | null>(null)
   const [dropId, setDropId] = useState<string>('all')
   const [days, setDays] = useState<(typeof RANGES)[number]>(30)
-  const [events, setEvents] = useState<EventRow[] | null>(null)
-  const [waitlistTotal, setWaitlistTotal] = useState(0)
+  const [raw, setRaw] = useState<Stats | null>(null)
 
   useEffect(() => {
-    if (!supabase || !user) return
-    supabase
-      .from('drops')
-      .select('*')
-      .eq('user_id', user.id)
-      .order('created_at', { ascending: false })
-      .then(({ data }) => setDrops((data ?? []) as Drop[]))
-  }, [user])
+    api.get<{ drops: Drop[] }>('drops').then((d) => setDrops(d.drops)).catch(() => setDrops([]))
+  }, [])
 
   useEffect(() => {
-    if (!supabase || !drops || drops.length === 0) return
-    const ids = dropId === 'all' ? drops.map((d) => d.id) : [dropId]
-    const since = new Date(Date.now() - days * 86_400_000).toISOString()
-    setEvents(null)
-    Promise.all([
-      supabase.from('drop_events').select('drop_id, type, visitor_id, created_at').in('drop_id', ids).gte('created_at', since).limit(50_000),
-      supabase.from('waitlist').select('id', { count: 'exact', head: true }).in('drop_id', ids),
-    ]).then(([ev, wl]) => {
-      setEvents((ev.data ?? []) as EventRow[])
-      setWaitlistTotal(wl.count ?? 0)
-    })
+    if (!drops?.length) return
+    setRaw(null)
+    api.get<Stats>(`analytics?drop=${encodeURIComponent(dropId)}&days=${days}`).then(setRaw).catch(() => {})
   }, [drops, dropId, days])
 
-  const stats = useMemo(() => {
-    if (!events) return null
-    const views = events.filter((e) => e.type === 'view')
-    const visitors = new Set(views.map((e) => e.visitor_id)).size
-    const signups = events.filter((e) => e.type === 'signup').length
-    const clicks = events.filter((e) => e.type === 'click').length
-    const byDay = new Map<string, { views: number; signups: number; clicks: number }>()
-    for (let i = days - 1; i >= 0; i--) byDay.set(dayKey(new Date(Date.now() - i * 86_400_000)), { views: 0, signups: 0, clicks: 0 })
-    for (const e of events) {
-      const bucket = byDay.get(e.created_at.slice(0, 10))
-      if (!bucket) continue
-      if (e.type === 'view') bucket.views++
-      else if (e.type === 'signup') bucket.signups++
-      else bucket.clicks++
-    }
-    return {
-      views: views.length,
-      visitors,
-      signups,
-      clicks,
-      signupRate: visitors ? (signups / visitors) * 100 : 0,
-      clickRate: visitors ? (clicks / visitors) * 100 : 0,
-      series: [...byDay.entries()].map(([day, v]) => ({ day, ...v })),
-    }
-  }, [events, days])
+  const stats = raw && {
+    ...raw,
+    signupRate: raw.visitors ? (raw.signups / raw.visitors) * 100 : 0,
+    clickRate: raw.visitors ? (raw.clicks / raw.visitors) * 100 : 0,
+  }
+  const waitlistTotal = raw?.waitlistTotal ?? 0
 
-  if (!supabase) return <NeedsDatabase feature="Launch Analytics" />
   if (!drops) return <Spinner label="Loading…" />
   if (drops.length === 0) return <EmptyState title="No drops to analyze yet">Create a drop and share its page. Visits and sign-ups show up here.</EmptyState>
 

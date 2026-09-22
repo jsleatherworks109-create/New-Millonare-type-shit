@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { Link } from 'react-router-dom'
 import { CopyButton, Spinner, errorMessage } from '../../components/ui'
 import { api } from '../../lib/api'
-import { supabase } from '../../lib/supabase'
+import { aiWaitHint, useAppStatus } from '../../lib/status'
 
 type Category = 'conversion' | 'trust' | 'product' | 'mobile' | 'seo'
 
@@ -17,13 +16,12 @@ interface Check {
 }
 
 interface AnalysisResult {
+  id: string
   url: string
   analyzedAt: string
-  full: boolean
   score: number
   categories: { category: Category; score: number }[]
   checks: Check[]
-  hiddenIssues: number
   speed: { performance: number | null; lcpSeconds: number | null; cls: number | null; tbtMs: number | null } | null
   advice: {
     summary: string
@@ -31,7 +29,6 @@ interface AnalysisResult {
     quick_wins: string[]
     copy_suggestions: { element: string; current: string; suggested: string }[]
   } | null
-  aiNote: string | null
   speedNote?: string | null
   responseMs: number
 }
@@ -56,15 +53,7 @@ export function StoreAnalyzer() {
   const [history, setHistory] = useState<{ id: string; url: string; score: number; created_at: string; result: AnalysisResult }[]>([])
   const resultRef = useRef<HTMLDivElement>(null)
 
-  const loadHistory = async () => {
-    if (!supabase) return
-    const { data } = await supabase
-      .from('store_analyses')
-      .select('id, url, score, created_at, result')
-      .order('created_at', { ascending: false })
-      .limit(15)
-    setHistory(data ?? [])
-  }
+  const loadHistory = () => api.get<{ items: typeof history }>('analyze/history').then((d) => setHistory(d.items)).catch(() => {})
   useEffect(() => {
     loadHistory()
   }, [])
@@ -93,14 +82,24 @@ export function StoreAnalyzer() {
             <span>Store or product page URL</span>
             <input required inputMode="url" placeholder="yourstore.com or a product page link" value={url} onChange={(e) => setUrl(e.target.value)} />
           </label>
-          <button className="btn btn--primary" disabled={busy}>{busy ? 'Analyzing…' : 'Analyze'}</button>
+          <button className="btn btn--primary" disabled={busy}>{busy ? 'Scanning…' : 'Scan'}</button>
         </div>
-        {busy && <Spinner label="Visiting your store as a phone shopper, testing speed and writing recommendations. Up to a minute." />}
+        {busy && <Spinner label="Visiting the store as a phone shopper and running every check…" />}
         {error && <p className="form-error">{error}</p>}
-        <p className="muted small">Tip: analyze a product page as well as your homepage. That’s where most sales are won or lost.</p>
+        <p className="muted small">Tip: scan a product page as well as your homepage. That’s where most sales are won or lost.</p>
       </form>
 
-      <div ref={resultRef}>{result && <AnalysisReport result={result} />}</div>
+      <div ref={resultRef}>
+        {result && (
+          <AnalysisReport
+            result={result}
+            onAdvice={(r) => {
+              setResult(r)
+              loadHistory()
+            }}
+          />
+        )}
+      </div>
 
       {history.length > 0 && (
         <section className="section-block">
@@ -108,12 +107,12 @@ export function StoreAnalyzer() {
           <div className="list">
             {history.map((h) => (
               <button key={h.id} className="list__item" onClick={() => {
-                setResult(h.result)
+                setResult({ ...h.result, id: h.id })
                 setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth' }), 50)
               }}>
                 <span className={`score-pill score-pill--${tone(h.score)}`}>{h.score}</span>
                 <strong className="truncate">{h.url}</strong>
-                <span className="muted small">{new Date(h.created_at).toLocaleDateString()}</span>
+                <span className="muted small">{h.result.advice ? 'AI advice ✓ · ' : ''}{new Date(h.created_at).toLocaleDateString()}</span>
               </button>
             ))}
           </div>
@@ -123,7 +122,48 @@ export function StoreAnalyzer() {
   )
 }
 
-function AnalysisReport({ result }: { result: AnalysisResult }) {
+function AdvicePanel({ result, onAdvice }: { result: AnalysisResult; onAdvice: (r: AnalysisResult) => void }) {
+  const { ai } = useAppStatus()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [started, setStarted] = useState(0)
+  const [, setTick] = useState(0)
+
+  useEffect(() => {
+    if (!busy) return
+    const id = setInterval(() => setTick((t) => t + 1), 1000)
+    return () => clearInterval(id)
+  }, [busy])
+
+  const run = async () => {
+    setBusy(true)
+    setError(null)
+    setStarted(Date.now())
+    try {
+      const { result: updated } = await api.post<{ result: AnalysisResult }>('analyze/advice', { id: result.id })
+      onAdvice({ ...updated, id: result.id })
+    } catch (e) {
+      setError(errorMessage(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const elapsed = Math.floor((Date.now() - started) / 1000)
+  return (
+    <div className="panel">
+      <div>
+        <h3>AI recommendations</h3>
+        <p className="muted">Prioritised fixes, quick wins and copy rewrites written for this store. {aiWaitHint(ai, '3–5 minutes')}</p>
+        {busy && <Spinner label={`Thinking… ${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')}`} />}
+        {error && <p className="form-error">{error}</p>}
+      </div>
+      <button className="btn btn--primary" onClick={run} disabled={busy || ai?.ready === false}>{busy ? 'Working…' : 'Get AI advice'}</button>
+    </div>
+  )
+}
+
+function AnalysisReport({ result, onAdvice }: { result: AnalysisResult; onAdvice: (r: AnalysisResult) => void }) {
   const failed = result.checks.filter((c) => !c.pass).sort((a, b) => b.weight - a.weight)
   const passed = result.checks.filter((c) => c.pass)
 
@@ -149,15 +189,7 @@ function AnalysisReport({ result }: { result: AnalysisResult }) {
         </div>
       </section>
 
-      {!result.full && (
-        <div className="panel">
-          <div>
-            <h3>{result.hiddenIssues > 0 ? `${result.hiddenIssues} more issues found` : 'Get the full report'}</h3>
-            <p className="muted">Growth unlocks every check, mobile speed testing, and AI recommendations written for your store.</p>
-          </div>
-          <Link to="/app/billing" className="btn btn--primary">Upgrade</Link>
-        </div>
-      )}
+      {!result.advice && <AdvicePanel result={result} onAdvice={onAdvice} />}
 
       {result.advice && (
         <>
@@ -201,7 +233,6 @@ function AnalysisReport({ result }: { result: AnalysisResult }) {
           </div>
         </>
       )}
-      {result.aiNote && <p className="form-notice">{result.aiNote}</p>}
       {result.speedNote && <p className="form-notice">{result.speedNote}</p>}
 
       {result.speed && (
@@ -217,7 +248,7 @@ function AnalysisReport({ result }: { result: AnalysisResult }) {
       )}
 
       <section className="card">
-        <h3>{result.full ? `Issues (${failed.length})` : 'Top issues'}</h3>
+        <h3>Issues ({failed.length})</h3>
         <div className="stack">
           {failed.map((c) => (
             <div key={c.id} className="check check--fail">

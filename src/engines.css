@@ -196,3 +196,10 @@ details.card[open] summary { margin-bottom: 0.75rem; }
 .chart__bar.is-hover { opacity: 1; }
 .chart__tip { position: absolute; top: 0; transform: translateX(-50%); background: var(--ink); color: var(--ink-contrast); font-size: 0.8rem; padding: 0.35rem 0.6rem; border-radius: 8px; pointer-events: none; white-space: nowrap; display: grid; text-align: center; }
 .chart__tip span { opacity: 0.75; font-size: 0.72rem; }
+
+/* Local status dot */
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); flex-shrink: 0; }
+.dot--ok { background: #1f9d63; }
+.dot--bad { background: #d6452b; }
+.card.row { display: flex; }
+.card select, .filters select, .card__head select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 0.55rem 0.75rem; }

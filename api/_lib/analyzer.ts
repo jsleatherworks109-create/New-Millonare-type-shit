@@ -1,7 +1,7 @@
 import * as cheerio from 'cheerio'
 import { z } from 'zod'
-import { admin, enforceDailyLimit, getCaller, hasPlan } from './auth.js'
-import { aiConfigured, generateStructured } from './claude.js'
+import { generateStructured } from './ai.js'
+import { db, newId, parseJson } from './db.js'
 import { HttpError, json, readJson, str } from './http.js'
 import { fetchPublicPage } from './safeFetch.js'
 
@@ -191,7 +191,7 @@ async function pageSpeed(url: string): Promise<PageSpeed | null> {
 }
 
 const AdviceSchema = z.object({
-  summary: z.string().describe('3-4 sentence plain-English verdict on the store.'),
+  summary: z.string().describe('2-3 sentence plain-English verdict on the store.'),
   priorities: z
     .array(
       z.object({
@@ -202,17 +202,25 @@ const AdviceSchema = z.object({
         how: z.string().describe('Specific steps, referencing what is actually on the page.'),
       }),
     )
-    .describe('5-8 prioritised fixes, highest impact first.'),
-  quick_wins: z.array(z.string()).describe('4-6 changes that take under 30 minutes.'),
+    .describe('4 prioritised fixes, highest impact first.'),
+  quick_wins: z.array(z.string()).describe('4 changes that take under 30 minutes.'),
   copy_suggestions: z
     .array(z.object({ element: z.string(), current: z.string(), suggested: z.string() }))
-    .describe('2-4 rewrites of headlines, buttons or descriptions seen on the page.'),
+    .describe('2 rewrites of headlines, buttons or descriptions seen on the page.'),
 })
 export type Advice = z.infer<typeof AdviceSchema>
 
+interface StoredResult {
+  url: string
+  score: number
+  checks: Check[]
+  speed: unknown
+  page?: ReturnType<typeof runChecks>['page']
+  [key: string]: unknown
+}
+
+/** Fast part: fetch the store and run every rule-based check. No AI, no cost. */
 export async function handleAnalyze(req: Request): Promise<Response> {
-  const caller = await getCaller(req)
-  await enforceDailyLimit(caller, 'store_analyses', { free: 3, growth: 30, scale: 100 })
   const body = await readJson<{ url?: string }>(req, 5_000)
   const rawUrl = str(body.url, 500, 'Store URL', true)
 
@@ -224,76 +232,69 @@ export async function handleAnalyze(req: Request): Promise<Response> {
     throw new HttpError(422, 'That link didn’t return a web page.')
   }
 
-  const full = hasPlan(caller, 'growth')
   const [report, speed] = await Promise.all([
     Promise.resolve(runChecks(page.html, page.finalUrl, page.ms, page.bytes)),
-    full ? pageSpeed(page.finalUrl) : Promise.resolve(null),
+    pageSpeed(page.finalUrl),
   ])
 
-  let advice: Advice | null = null
-  let aiNote: string | null = null
-  if (full && aiConfigured()) {
-    try {
-      advice = await generateStructured({
-        schema: AdviceSchema,
-        system:
-          'You are a senior e-commerce conversion consultant reviewing a small brand’s online store for Selamont. Be specific to this store, practical, and honest. Base every point on the evidence given; never invent numbers, traffic or sales figures.',
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              url: page.finalUrl,
-              score: report.score,
-              failedChecks: report.checks.filter((c) => !c.pass).map((c) => ({ check: c.label, detail: c.detail })),
-              passedChecks: report.checks.filter((c) => c.pass).map((c) => c.label),
-              mobilePageSpeed: speed,
-              title: report.page.title,
-              metaDescription: report.page.metaDescription,
-              headings: report.page.headings,
-              visibleText: report.page.visibleText,
-            }),
-          },
-        ],
-      })
-    } catch (err) {
-      aiNote = err instanceof HttpError ? err.message : 'AI recommendations were unavailable for this scan.'
-    }
-  } else if (full) {
-    aiNote = 'AI recommendations are off because ANTHROPIC_API_KEY is not set on the server.'
-  }
+  const speedNote = speed
+    ? null
+    : process.env.PAGESPEED_API_KEY
+      ? 'Google’s mobile speed test didn’t respond this time. Try again later.'
+      : 'Mobile speed test skipped: add a free PAGESPEED_API_KEY to .env (see README).'
 
-  const speedNote =
-    full && !speed
-      ? process.env.PAGESPEED_API_KEY
-        ? 'Google’s mobile speed test didn’t respond this time. Try again later.'
-        : 'Mobile speed test skipped: add a free PAGESPEED_API_KEY to the server (see README).'
-      : null
-
-  // Starter plan: overall score, category scores and the top three problems only.
-  const failed = report.checks.filter((c) => !c.pass).sort((a, b) => b.weight - a.weight)
+  const id = newId()
   const result = {
+    id,
     url: page.finalUrl,
     analyzedAt: new Date().toISOString(),
-    full,
     score: report.score,
     categories: report.categories,
-    checks: full ? report.checks : failed.slice(0, 3),
-    hiddenIssues: full ? 0 : Math.max(0, failed.length - 3),
+    checks: report.checks,
     speed,
     speedNote,
-    advice,
-    aiNote,
+    advice: null as Advice | null,
     responseMs: page.ms,
+    page: report.page,
   }
+  db().prepare('INSERT INTO store_analyses (id, url, score, result) VALUES (?, ?, ?, ?)').run(id, page.finalUrl, report.score, JSON.stringify(result))
+  return json({ result })
+}
 
-  let id: string | null = null
-  if (admin && caller.user) {
-    const { data } = await admin
-      .from('store_analyses')
-      .insert({ user_id: caller.user.id, url: page.finalUrl, score: report.score, result })
-      .select('id')
-      .single()
-    id = data?.id ?? null
-  }
-  return json({ id, result })
+/** Slow part (optional): AI-written recommendations for a scan that already ran. */
+export async function handleAdvice(req: Request): Promise<Response> {
+  const { id } = await readJson<{ id?: string }>(req, 1_000)
+  const row = db().prepare('SELECT result FROM store_analyses WHERE id = ?').get(id ?? '') as { result: string } | undefined
+  if (!row) throw new HttpError(404, 'Scan not found. Run the scan again.')
+  const result = parseJson<StoredResult | null>(row.result, null)
+  if (!result) throw new HttpError(500, 'Saved scan is unreadable.')
+
+  const advice = await generateStructured({
+    schema: AdviceSchema,
+    maxTokens: 1100,
+    system:
+      'You are a senior e-commerce conversion consultant reviewing a small brand’s online store. Be specific to this store, practical and honest. Base every point on the evidence given; never invent numbers, traffic or sales figures.',
+    prompt: JSON.stringify({
+      url: result.url,
+      score: result.score,
+      failedChecks: result.checks.filter((c) => !c.pass).map((c) => `${c.label}: ${c.detail}`),
+      passedChecks: result.checks.filter((c) => c.pass).map((c) => c.label),
+      mobileSpeed: result.speed ?? 'not measured',
+      title: result.page?.title,
+      metaDescription: result.page?.metaDescription,
+      headings: result.page?.headings?.slice(0, 12),
+      visibleText: result.page?.visibleText?.slice(0, 2500),
+    }),
+  })
+
+  const updated = { ...result, advice }
+  db().prepare('UPDATE store_analyses SET result = ? WHERE id = ?').run(JSON.stringify(updated), id ?? '')
+  return json({ result: updated })
+}
+
+export function handleAnalysisHistory(): Response {
+  const rows = db()
+    .prepare('SELECT id, url, score, result, created_at FROM store_analyses ORDER BY created_at DESC LIMIT 20')
+    .all() as { id: string; url: string; score: number; result: string; created_at: string }[]
+  return json({ items: rows.map((r) => ({ ...r, result: JSON.parse(r.result) })) })
 }

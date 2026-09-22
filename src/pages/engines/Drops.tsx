@@ -1,44 +1,30 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react'
-import { Link } from 'react-router-dom'
-import { CopyButton, EmptyState, NeedsDatabase, Spinner, errorMessage } from '../../components/ui'
+import { CopyButton, EmptyState, Spinner, errorMessage } from '../../components/ui'
 import { api } from '../../lib/api'
-import { useAuth } from '../../lib/auth'
-import { dropUrl, slugify, toLocalInput, type Drop } from '../../lib/drops'
+import { slugify, toLocalInput, type Drop } from '../../lib/drops'
 import { prepareImage } from '../../lib/images'
-import { hasAccess } from '../../lib/plans'
-import { supabase } from '../../lib/supabase'
+import { aiWaitHint, useAppStatus } from '../../lib/status'
+
+type DropRow = Drop & { waitlist_count?: number }
 
 export function Drops() {
-  const { user, plan } = useAuth()
-  const [drops, setDrops] = useState<Drop[]>([])
-  const [counts, setCounts] = useState<Record<string, number>>({})
-  const [loading, setLoading] = useState(true)
+  const [drops, setDrops] = useState<DropRow[] | null>(null)
   const [editing, setEditing] = useState<Drop | 'new' | null>(null)
   const [selected, setSelected] = useState<Drop | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
-    if (!supabase || !user) return
-    const { data, error } = await supabase.from('drops').select('*').eq('user_id', user.id).order('created_at', { ascending: false })
-    if (error) setError(error.message)
-    const list = (data ?? []) as Drop[]
-    setDrops(list)
-    if (list.length) {
-      const { data: rows } = await supabase.from('waitlist').select('drop_id').in('drop_id', list.map((d) => d.id))
-      const c: Record<string, number> = {}
-      for (const r of rows ?? []) c[r.drop_id] = (c[r.drop_id] ?? 0) + 1
-      setCounts(c)
+    try {
+      setDrops((await api.get<{ drops: DropRow[] }>('drops')).drops)
+    } catch (e) {
+      setError(errorMessage(e))
+      setDrops([])
     }
-    setLoading(false)
-  }, [user])
+  }, [])
 
   useEffect(() => {
     load()
   }, [load])
-
-  if (!supabase) return <NeedsDatabase feature="Drops & Launches" />
-
-  const canCreate = hasAccess(plan, 'growth') || drops.length < 1
 
   if (editing) {
     return (
@@ -58,7 +44,10 @@ export function Drops() {
     return (
       <DropDetail
         drop={selected}
-        onBack={() => setSelected(null)}
+        onBack={() => {
+          setSelected(null)
+          load()
+        }}
         onEdit={() => setEditing(selected)}
         onChanged={async (d) => {
           await load()
@@ -72,14 +61,11 @@ export function Drops() {
     <>
       <div className="toolbar">
         <p className="muted">Create a launch page with a countdown and waitlist, share the link, and watch sign-ups roll in.</p>
-        {canCreate ? (
-          <button className="btn btn--primary" onClick={() => setEditing('new')}>+ New drop</button>
-        ) : (
-          <Link className="btn btn--primary" to="/app/billing">Upgrade for more drops</Link>
-        )}
+        <button className="btn btn--primary" onClick={() => setEditing('new')}>+ New drop</button>
       </div>
+      <SharingPanel />
       {error && <p className="form-error">{error}</p>}
-      {loading ? (
+      {!drops ? (
         <Spinner label="Loading drops…" />
       ) : drops.length === 0 ? (
         <EmptyState title="No drops yet">Create your first launch page. It takes about a minute.</EmptyState>
@@ -92,13 +78,33 @@ export function Drops() {
                 <span className={`tag tag--${d.status}`}>{d.status}</span>
                 <h3>{d.title}</h3>
                 <p className="muted small">Launches {new Date(d.launch_at).toLocaleString()}</p>
-                <p className="small"><strong>{counts[d.id] ?? 0}</strong> on the waitlist</p>
+                <p className="small"><strong>{d.waitlist_count ?? 0}</strong> on the waitlist</p>
               </div>
             </button>
           ))}
         </div>
       )}
     </>
+  )
+}
+
+function SharingPanel() {
+  const { publicUrl } = useAppStatus()
+  if (publicUrl) {
+    return (
+      <div className="form-notice">
+        <strong>Sharing is on.</strong> Shoppers can open your live drops at <code>{publicUrl}/d/…</code>. Keep the sharing window open.
+      </div>
+    )
+  }
+  return (
+    <div className="panel panel--stack small">
+      <strong>Launch pages are only visible on this PC right now.</strong>
+      <span className="muted">
+        To let shoppers see them, double-click <code>Share launch pages.bat</code> in the Selamont folder (or run <code>npm run share</code>).
+        It creates a free public link that only shows launch pages, never your tools.
+      </span>
+    </div>
   )
 }
 
@@ -132,32 +138,24 @@ function DropForm({ drop, onCancel, onSaved }: { drop: Drop | null; onCancel: ()
     setBusy(true)
     setError(null)
     const row = {
-      title: title.trim(),
+      id: drop?.id,
+      title,
       slug: slug || slugify(title),
-      description: description.trim() || null,
-      image_url: imageUrl.trim() || null,
-      price: price.trim() || null,
-      store_url: storeUrl.trim() || null,
+      description,
+      image_url: imageUrl,
+      price,
+      store_url: storeUrl,
       launch_at: new Date(launchAt).toISOString(),
       quantity: quantity ? Number(quantity) : null,
       status,
     }
-    const query = drop
-      ? supabase!.from('drops').update(row).eq('id', drop.id).select().single()
-      : supabase!.from('drops').insert(row).select().single()
-    const { data, error } = await query
-    setBusy(false)
-    if (error) {
-      setError(
-        error.code === '23505'
-          ? 'That link name is taken. Try another.'
-          : error.code === '42501'
-            ? 'The Starter plan includes one launch page. Upgrade to create more.'
-            : error.message,
-      )
-      return
+    try {
+      const { drop: saved } = await api.post<{ drop: Drop }>(drop ? 'drops/update' : 'drops/create', row)
+      onSaved(saved)
+    } catch (err) {
+      setError(errorMessage(err))
+      setBusy(false)
     }
-    onSaved(data as Drop)
   }
 
   return (
@@ -186,7 +184,7 @@ function DropForm({ drop, onCancel, onSaved }: { drop: Drop | null; onCancel: ()
       </label>
       <div className="grid-2">
         <label className="field">
-          <span>Launch date & time (your time zone)</span>
+          <span>Launch date & time</span>
           <input type="datetime-local" required value={launchAt} onChange={(e) => setLaunchAt(e.target.value)} />
         </label>
         <label className="field">
@@ -232,7 +230,6 @@ function DropForm({ drop, onCancel, onSaved }: { drop: Drop | null; onCancel: ()
 
 interface DropCopy {
   email_subject: string
-  email_preview: string
   email_body: string
   instagram_caption: string
   tiktok_script: string
@@ -241,20 +238,15 @@ interface DropCopy {
 }
 
 function DropDetail({ drop, onBack, onEdit, onChanged }: { drop: Drop; onBack: () => void; onEdit: () => void; onChanged: (d: Drop) => void }) {
-  const { plan } = useAuth()
+  const { ai, publicUrl } = useAppStatus()
   const [waitlist, setWaitlist] = useState<{ email: string; created_at: string }[]>([])
   const [copy, setCopy] = useState<DropCopy | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const link = dropUrl(drop.slug)
+  const publicLink = publicUrl ? `${publicUrl}/d/${drop.slug}` : null
 
   useEffect(() => {
-    supabase!
-      .from('waitlist')
-      .select('email, created_at')
-      .eq('drop_id', drop.id)
-      .order('created_at', { ascending: false })
-      .then(({ data }) => setWaitlist(data ?? []))
+    api.get<{ waitlist: typeof waitlist }>(`drops/waitlist?id=${encodeURIComponent(drop.id)}`).then((d) => setWaitlist(d.waitlist)).catch(() => {})
   }, [drop.id])
 
   const exportCsv = () => {
@@ -276,7 +268,7 @@ function DropDetail({ drop, onBack, onEdit, onChanged }: { drop: Drop; onBack: (
         price: drop.price,
         launchAt: new Date(drop.launch_at).toLocaleString(),
         quantity: drop.quantity,
-        url: link,
+        url: publicLink ?? '',
       })
       setCopy(output)
     } catch (e) {
@@ -287,16 +279,21 @@ function DropDetail({ drop, onBack, onEdit, onChanged }: { drop: Drop; onBack: (
   }
 
   const setStatus = async (status: Drop['status']) => {
-    const { data, error } = await supabase!.from('drops').update({ status }).eq('id', drop.id).select().single()
-    if (error) setError(error.message)
-    else onChanged(data as Drop)
+    try {
+      onChanged((await api.post<{ drop: Drop }>('drops/update', { id: drop.id, status })).drop)
+    } catch (e) {
+      setError(errorMessage(e))
+    }
   }
 
   const remove = async () => {
     if (!confirm(`Delete "${drop.title}" and its waitlist? This can’t be undone.`)) return
-    const { error } = await supabase!.from('drops').delete().eq('id', drop.id)
-    if (error) setError(error.message)
-    else onBack()
+    try {
+      await api.post('drops/delete', { id: drop.id })
+      onBack()
+    } catch (e) {
+      setError(errorMessage(e))
+    }
   }
 
   return (
@@ -310,18 +307,22 @@ function DropDetail({ drop, onBack, onEdit, onChanged }: { drop: Drop; onBack: (
             <span className={`tag tag--${drop.status}`}>{drop.status}</span>
           </div>
           <p className="muted">Launches {new Date(drop.launch_at).toLocaleString()}{drop.price ? ` · ${drop.price}` : ''}{drop.quantity ? ` · ${drop.quantity} available` : ''}</p>
-          <div className="link-box">
-            <code className="truncate">{link}</code>
-            <CopyButton text={link} label="Copy link" />
-            <a className="btn btn--ghost btn--xs" href={`/d/${drop.slug}`} target="_blank" rel="noreferrer">Open ↗</a>
-          </div>
-          {drop.status === 'draft' && <p className="form-notice">This drop is a draft. Only you can see the page. Set it live to start collecting sign-ups.</p>}
+          {publicLink ? (
+            <div className="link-box">
+              <code className="truncate">{publicLink}</code>
+              <CopyButton text={publicLink} label="Copy public link" />
+            </div>
+          ) : (
+            <p className="muted small">Public link appears here when sharing is on (see the Drops page).</p>
+          )}
           <div className="row">
+            <a className="btn btn--ghost btn--sm" href={`/d/${drop.slug}`} target="_blank" rel="noreferrer">Preview page ↗</a>
             <button className="btn btn--ghost btn--sm" onClick={onEdit}>Edit</button>
             {drop.status !== 'live' && <button className="btn btn--ghost btn--sm" onClick={() => setStatus('live')}>Set live</button>}
             {drop.status === 'live' && <button className="btn btn--ghost btn--sm" onClick={() => setStatus('ended')}>End drop</button>}
             <button className="btn btn--ghost btn--sm danger" onClick={remove}>Delete</button>
           </div>
+          {drop.status === 'draft' && <p className="form-notice">Draft: shoppers can’t see this page. Set it live to start collecting sign-ups.</p>}
         </div>
       </section>
       {error && <p className="form-error">{error}</p>}
@@ -336,7 +337,7 @@ function DropDetail({ drop, onBack, onEdit, onChanged }: { drop: Drop; onBack: (
             <p className="muted">No sign-ups yet. Share your link in your bio, stories and emails.</p>
           ) : (
             <ul className="plain-list">
-              {waitlist.slice(0, 50).map((w) => (
+              {waitlist.slice(0, 100).map((w) => (
                 <li key={w.email}><span className="truncate">{w.email}</span><span className="muted small">{new Date(w.created_at).toLocaleDateString()}</span></li>
               ))}
             </ul>
@@ -345,24 +346,17 @@ function DropDetail({ drop, onBack, onEdit, onChanged }: { drop: Drop; onBack: (
 
         <section className="card">
           <h3>Launch announcements</h3>
-          {hasAccess(plan, 'growth') ? (
-            <>
-              <p className="muted">Email, Instagram, TikTok, SMS and a countdown schedule written for this drop.</p>
-              <button className="btn btn--primary" onClick={writeCopy} disabled={busy}>{busy ? 'Writing…' : copy ? 'Write new versions' : 'Write announcements'}</button>
-              {busy && <Spinner label="Writing announcements…" />}
-            </>
-          ) : (
-            <p className="muted">AI-written announcements are included with Growth. <Link to="/app/billing">Upgrade</Link></p>
-          )}
+          <p className="muted">Email, Instagram, TikTok, SMS and countdown posts written for this drop. {aiWaitHint(ai, '2–4 minutes')}</p>
+          <button className="btn btn--primary" onClick={writeCopy} disabled={busy || ai?.ready === false}>{busy ? 'Writing…' : copy ? 'Write new versions' : 'Write announcements'}</button>
+          {busy && <Spinner label="Writing announcements…" />}
         </section>
       </div>
 
       {copy && (
         <div className="results">
           <section className="card">
-            <div className="card__head"><h3>Email</h3><CopyButton text={`Subject: ${copy.email_subject}\nPreview: ${copy.email_preview}\n\n${copy.email_body}`} /></div>
+            <div className="card__head"><h3>Email</h3><CopyButton text={`Subject: ${copy.email_subject}\n\n${copy.email_body}`} /></div>
             <p><strong>Subject:</strong> {copy.email_subject}</p>
-            <p className="muted small">Preview: {copy.email_preview}</p>
             <p className="pre">{copy.email_body}</p>
           </section>
           <div className="grid-2">

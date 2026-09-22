@@ -27,17 +27,6 @@ export function Spinner({ label }: { label: string }) {
   )
 }
 
-export function NeedsDatabase({ feature }: { feature: string }) {
-  return (
-    <div className="panel panel--stack">
-      <h3>{feature} needs a database</h3>
-      <p className="muted">
-        You’re in demo mode, which only simulates sign-in. Connect a free Supabase project (steps in <code>README.md</code>)
-        and {feature} will save launches, sign-ups and deals for real.
-      </p>
-    </div>
-  )
-}
 
 export function EmptyState({ title, children }: { title: string; children?: ReactNode }) {
   return (

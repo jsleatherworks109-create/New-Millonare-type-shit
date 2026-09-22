@@ -1,18 +1,17 @@
 import type { ComponentType } from 'react'
 import { Navigate, useParams } from 'react-router-dom'
-import { Paywall } from '../components/Paywall'
 import { findProduct } from '../lib/products'
 import { Analytics } from './engines/Analytics'
 import { ContentEngine } from './engines/ContentEngine'
+import { Creators } from './engines/Creators'
 import { Drops } from './engines/Drops'
-import { Marketplace } from './engines/Marketplace'
 import { StoreAnalyzer } from './engines/StoreAnalyzer'
 
 const ENGINES: Record<string, ComponentType> = {
   content: ContentEngine,
   analyzer: StoreAnalyzer,
   drops: Drops,
-  creators: Marketplace,
+  creators: Creators,
   analytics: Analytics,
 }
 
@@ -28,13 +27,7 @@ export function ProductPage() {
         <h1><span className="page__icon" aria-hidden="true">{product.icon}</span>{product.name}</h1>
         <p className="muted">{product.tagline}</p>
       </header>
-      {product.required === 'free' ? (
-        <Engine />
-      ) : (
-        <Paywall required={product.required} feature={product.name}>
-          <Engine />
-        </Paywall>
-      )}
+      <Engine />
     </div>
   )
 }

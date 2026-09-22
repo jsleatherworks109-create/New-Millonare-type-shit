@@ -1,6 +1,5 @@
 export interface Drop {
   id: string
-  user_id: string
   slug: string
   title: string
   description: string | null
@@ -22,9 +21,6 @@ export function slugify(text: string): string {
     .slice(0, 50)
 }
 
-export function dropUrl(slug: string): string {
-  return `${window.location.origin}/d/${slug}`
-}
 
 /** Anonymous id for counting unique visitors on public launch pages. No personal data. */
 export function visitorId(): string {
